@@ -29,8 +29,8 @@ def _read_json(path: Path) -> dict:
         raise ProjectError(f"{path.name} is unreasonably large")
     try:
         data = json.loads(path.read_text("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise ProjectError(f"{path.name}: invalid JSON ({e})") from None
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
+        raise ProjectError(f"{path.name}: invalid JSON ({type(e).__name__})") from None
     if not isinstance(data, dict):
         raise ProjectError(f"{path.name}: top level must be an object")
     return data
@@ -127,6 +127,30 @@ def ensure_safe_target(root: Path, rel: str) -> Path:
     return cur
 
 
+def case_clash(root: Path, rel: str):
+    """An existing path that differs from `rel` only by letter case (it would be overwritten on
+    Windows/macOS although it looks like a different file on Linux), or None."""
+    cur = root
+    for part in rel.split("/"):
+        try:
+            names = os.listdir(cur)
+        except OSError:
+            return None
+        if part not in names:
+            low = part.lower()
+            for n in names:
+                if n.lower() == low:
+                    return (cur / n).relative_to(root).as_posix()
+            return None
+        cur = cur / part
+    return None
+
+
+def _namespace_of(rel: str) -> str:
+    p = rel.split("/")
+    return f"{p[0]}/{p[1]}"
+
+
 def _prune(root: Path, start: Path) -> None:
     stop = {root / "data", root / "assets", root}
     d = start
@@ -142,16 +166,36 @@ def _tag_title(rel: str) -> str:
 
 # ----------------------------------------------------------------- apply
 def apply_content(project: Project, lib_id: str, content: LibraryContent,
-                  owned: Optional[dict] = None) -> dict:
-    """Validate everything first, then write; roll back fully on any failure."""
+                  owned: Optional[dict] = None, owned_tags: Optional[dict] = None) -> dict:
+    """Validate everything first, then write; roll back fully on any failure.
+
+    `owned_tags` is the lock's previous tag record of this library (restore case): entries it says this
+    library added stay owned by it. Entries that were already present stay owned by whoever put them there."""
     owned = owned or {}
+    owned_tags = owned_tags or {}
     root = project.root
     others = {rel: oid for oid, e in project.lock["libraries"].items() if oid != lib_id
               for rel in e.get("files", {})}
     conflicts: list[str] = []
     to_copy: list[tuple[str, Path]] = []
+    # A library may not move into a namespace that belongs to another library or to this project.
+    ns_owner = {}
+    for oid, e in project.lock["libraries"].items():
+        if oid != lib_id:
+            for orel in e.get("files", {}):
+                ns_owner.setdefault(_namespace_of(orel), oid)
+    mine = project.manifest.get("name")
+    for ns in content.namespaces():
+        if ns in ns_owner:
+            conflicts.append(f"namespace '{ns}' is already used by library '{ns_owner[ns]}'")
+        elif isinstance(mine, str) and ns.split("/")[1] == mine:
+            conflicts.append(f"namespace '{ns}' is this project's own namespace")
     for rel, src in sorted(content.files.items()):
         target = ensure_safe_target(root, rel)
+        clash = case_clash(root, rel)
+        if clash:
+            conflicts.append(f"{rel} (differs only by case from existing '{clash}')")
+            continue
         if rel in others:
             conflicts.append(f"{rel} (owned by library '{others[rel]}')")
         elif os.path.lexists(target):
@@ -164,6 +208,10 @@ def apply_content(project: Project, lib_id: str, content: LibraryContent,
     tag_plans = []
     for rel, values in sorted(content.tags.items()):
         target = ensure_safe_target(root, rel)
+        clash = case_clash(root, rel)
+        if clash:
+            conflicts.append(f"{rel} (differs only by case from existing '{clash}')")
+            continue
         if os.path.lexists(target):
             if not target.is_file():
                 conflicts.append(f"{rel} (not a file)")
@@ -181,6 +229,7 @@ def apply_content(project: Project, lib_id: str, content: LibraryContent,
 
     created: list[Path] = []
     touched: list[tuple[Path, Optional[bytes]]] = []
+    added: dict[str, list] = {}
     try:
         for rel, src in to_copy:
             t = root / rel
@@ -189,10 +238,17 @@ def apply_content(project: Project, lib_id: str, content: LibraryContent,
             created.append(t)
         for rel, target, original, doc, values in tag_plans:
             have = {value_key(v) for v in doc["values"]}
+            prev = {value_key(v) for v in (owned_tags.get(rel) or {}).get("added", [])}
+            mine_added = []
             for v in values:
-                if value_key(v) not in have:
+                k = value_key(v)
+                if k not in have:
                     doc["values"].append(v)
-                    have.add(value_key(v))
+                    have.add(k)
+                    mine_added.append(v)
+                elif k in prev:
+                    mine_added.append(v)            # restore: still the entry this library put there
+            added[rel] = mine_added
             target.parent.mkdir(parents=True, exist_ok=True)
             touched.append((target, original))
             _write_json(target, doc)
@@ -208,7 +264,8 @@ def apply_content(project: Project, lib_id: str, content: LibraryContent,
                 t.write_bytes(original)
         raise
     return {"files": dict(sorted(content.hashes.items())),
-            "tags": {rel: {"values": list(v)} for rel, v in sorted(content.tags.items())},
+            "tags": {rel: {"values": list(v), "added": added.get(rel, [])}
+                     for rel, v in sorted(content.tags.items())},
             "integrity": content.integrity()}
 
 
@@ -266,7 +323,7 @@ def _enforce_audit(report: AuditReport, level: str) -> None:
 
 
 def _stage_and_apply(project, lib_id, source, ref, commit, allow_local, ignore_game_version,
-                     confirm: Confirm, owned=None, expected_integrity=None,
+                     confirm: Confirm, owned=None, expected_integrity=None, owned_tags=None,
                      fail_on: Optional[str] = None, skip_audit: bool = False,
                      pre_apply: Optional[Callable[[], None]] = None, old_files: Optional[dict] = None) -> dict:
     level = _fail_level(project, fail_on)
@@ -290,7 +347,7 @@ def _stage_and_apply(project, lib_id, source, ref, commit, allow_local, ignore_g
             raise Aborted("installation cancelled")
         if pre_apply is not None:
             pre_apply()
-        record = apply_content(project, lib_id, content, owned=owned)
+        record = apply_content(project, lib_id, content, owned=owned, owned_tags=owned_tags)
         if report is not None:
             record["audit"] = report.counts()
     record.update(source=source, ref=ref, commit=got)
@@ -368,7 +425,7 @@ def install_all(project: Project, allow_local: bool = False, extra_hosts=(),
         commit = safety.validate_commit(entry.get("commit", ""))
         rec = _stage_and_apply(project, lib_id, source, ref, commit, allow_local, True, None,
                                owned=entry.get("files", {}), expected_integrity=entry.get("integrity"),
-                               skip_audit=True)
+                               owned_tags=entry.get("tags", {}), skip_audit=True)
         project.lock["libraries"][lib_id] = rec
         results.append((lib_id, f"restored from lock @ {commit[:10]}"))
     project.save()
@@ -402,9 +459,20 @@ def remove_library(project: Project, lib_id: str, force: bool = False) -> Remove
         t = ensure_safe_target(root, rel)
         if not t.is_file():
             continue
-        shared = {value_key(v) for oid, e in project.lock["libraries"].items() if oid != lib_id
-                  for v in e.get("tags", {}).get(rel, {}).get("values", [])}
-        mine = {value_key(v) for v in rec.get("values", [])} - shared
+        others_rec = [e.get("tags", {}).get(rel) for oid, e in project.lock["libraries"].items() if oid != lib_id]
+        shared = {value_key(v) for r in others_rec if r for v in r.get("values", [])}
+        # Lock entries written before ownership tracking have no "added": treat all values as ours (old behaviour).
+        ours = rec["added"] if "added" in rec else rec.get("values", [])
+        mine = {value_key(v) for v in ours} - shared
+        for oid, e in project.lock["libraries"].items():          # entry still needed elsewhere: ownership moves on
+            orec = e.get("tags", {}).get(rel) if oid != lib_id else None
+            if orec is not None and "added" in orec:
+                have = {value_key(v) for v in orec["added"]}
+                for v in ours:
+                    k = value_key(v)
+                    if k in shared and k not in have and k in {value_key(x) for x in orec.get("values", [])}:
+                        orec["added"].append(v)
+                        have.add(k)
         doc = _read_json(t)
         doc["values"] = [v for v in doc.get("values", []) if value_key(v) not in mine]
         if not doc["values"] and set(doc) <= {"values"}:

@@ -60,7 +60,7 @@ def read_meta(root: Path) -> dict:
         return {}
     try:
         data = json.loads(p.read_text("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return {}
     out = {}
     if isinstance(data, dict):
@@ -73,8 +73,8 @@ def read_meta(root: Path) -> dict:
 def _parse_tag(path: Path, rel: str) -> list:
     try:
         doc = json.loads(path.read_text("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise ScanError(f"{rel}: invalid JSON tag ({e})") from None
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
+        raise ScanError(f"{rel}: invalid JSON tag ({type(e).__name__})") from None
     if not isinstance(doc, dict) or set(doc) - {"values", "replace"}:
         raise ScanError(f"{rel}: unexpected keys in tag file")
     if doc.get("replace") not in (None, False):
@@ -93,6 +93,7 @@ def scan(root: Path) -> LibraryContent:
     root = Path(root)
     out = LibraryContent()
     total = 0
+    lowered: dict[str, str] = {}
     for entry in sorted(os.listdir(root)):
         if entry not in ROOTS and entry != ".git":
             out.skipped.append(entry)                    # README, LICENSE, pack.mcmeta, ... never copied
@@ -118,6 +119,9 @@ def scan(root: Path) -> LibraryContent:
                     safety.validate_rel(rel)
                 except UnsafeInput as e:
                     raise ScanError(f"{rel}: {e}") from None
+                other = lowered.setdefault(rel.lower(), rel)
+                if other != rel:
+                    raise ScanError(f"{rel}: collides with '{other}' on case-insensitive filesystems")
                 if stat.S_ISDIR(st.st_mode):
                     continue
                 if not stat.S_ISREG(st.st_mode):

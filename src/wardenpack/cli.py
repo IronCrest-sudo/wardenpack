@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ref")
     s.add_argument("--allow-host", action="append", default=[], metavar="HOST")
     s.add_argument("--allow-local", action="store_true", help=argparse.SUPPRESS)
-    s.add_argument("--format", choices=("text", "json"), default="text")
+    s.add_argument("--format", choices=("text", "json", "sarif"), default="text")
     s.add_argument("--fail-on", choices=FAIL_LEVELS, default="high",
                    help="exit with status 2 if findings at/above this severity exist (default: high)")
     s.add_argument("-v", "--verbose", action="store_true", help="also print info-level findings")
@@ -293,7 +293,10 @@ def run_audit(args) -> int:
     name, report = audit_target(args.target, args.project_dir, args.ref, args.allow_host, args.allow_local)
     counts = report.counts(installed_only=False)
     blocking = report.blocking(args.fail_on, installed_only=False)
-    if args.format == "json":
+    if args.format == "sarif":
+        from .sarif import to_sarif
+        print(json.dumps(to_sarif(report, name), indent=2))
+    elif args.format == "json":
         print(json.dumps({"target": name, "summary": counts, "truncated": report.truncated,
                           "blocking": len(blocking),
                           "findings": [f.as_dict() for f in report.findings]}, indent=2))

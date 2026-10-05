@@ -15,6 +15,21 @@ _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,99}$")
 _BAD_CHARS = re.compile(r"[\x00-\x20\x7f\\]")      # control chars, space, backslash
 _SEGMENT = re.compile(r"^[A-Za-z0-9_.+-]+$")
 MAX_REL_LEN = 240
+_WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(\..*)?$", re.I)
+
+
+def windows_hazard(rel: str):
+    """Why this path misbehaves on Windows (reserved device names, trailing dot/space, ':'/ADS), or None."""
+    for seg in rel.split("/"):
+        if not seg:
+            continue
+        if _WIN_RESERVED.match(seg):
+            return f"'{seg}' is a reserved Windows device name"
+        if seg.endswith((".", " ")) and seg not in (".", ".."):
+            return f"'{seg}' ends with a dot/space (Windows silently renames it, e.g. 'x.exe.' -> 'x.exe')"
+        if ":" in seg:
+            return f"'{seg}' contains ':' (NTFS alternate data stream)"
+    return None
 
 
 def validate_lib_id(name: str) -> str:
@@ -106,4 +121,7 @@ def validate_rel(rel: str) -> str:
     for seg in rel.split("/"):
         if seg in ("", ".", "..") or not _SEGMENT.match(seg):
             raise UnsafeInput(f"invalid path segment in {rel!r}")
+    hazard = windows_hazard(rel)
+    if hazard:
+        raise UnsafeInput(f"unsafe path {rel!r}: {hazard}")
     return rel

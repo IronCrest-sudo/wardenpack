@@ -17,13 +17,20 @@ warden verify             # re-hash installed files against warden.lock
 warden update [names...] [--force]   # newest allowed revision, change list, rollback on failure
 warden import-sculk [libraries.json] [--apply]   # migrate from sculk-cli (dry run by default)
 warden list
-warden audit [folder | pack.zip | https-url] [--format json] [--fail-on high|medium|low|never]
+warden audit [folder | pack.zip | https-url] [--format text|json|sarif] [--fail-on high|medium|low|never]
 ```
 
 `add` and fresh `install` run the audit automatically on the staged copy. Default policy:
 **block on any high finding** (`--fail-on`, or `"audit": {"fail_on": "medium"}` in `warden.json`).
 Executables/scripts inside `data/` or `assets/` are **always** refused, whatever the policy.
 `warden audit` exits with status 2 when findings reach the threshold, so it works in CI.
+`--format sarif` emits SARIF 2.1.0 for GitHub code scanning:
+
+```yaml
+- run: warden audit . --format sarif --fail-on never > warden.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: { sarif_file: warden.sarif }
+```
 
 See [docs/COMPARISON.md](docs/COMPARISON.md) for an honest feature/limit comparison with sculk-cli.
 
@@ -87,6 +94,12 @@ frozen index can hide newer releases or revocations.
 | `SYMLINK`, `SPECIAL-FILE`, `ZIP-TRAVERSAL`, `ZIP-SYMLINK` | high | links, device files, zip entries that would escape the folder |
 | `KILL-MASS`, `CLEAR-MASS`, `SCORE-WIPE`, `BLOCK-VOLUME`, `RELOAD`, `DATAPACK-CTL`, `FORCELOAD`, `GAMERULE`, `ADMIN-KICK` | medium | broad destructive or world-wide commands |
 | `CLICK-RUN`, `ADV-TICK`, `RECURSION`, `NESTED-ARCHIVE` | medium | chat links that run commands, advancements firing every tick, unconditional function cycles, archives inside the pack |
+| `CMDBLOCK-INJECT`, `CMDBLOCK-NBT`, `CMDBLOCK-<rule>` | medium (inner command keeps its own severity) | a command that plants a command block/minecart (`setblock`, `summon`, `data merge` with `Command:`), or a `.nbt`/`.snbt` structure that carries one; the planted command is audited too |
+| `CLICK-RUN` (JSON) | medium | `run_command` click events and dialog actions in **any** JSON file (dialogs, books, loot tables, item components), not just `.mcfunction` |
+| `MACRO-FUNCTION` | medium | `$function` whose target contains `$(variable)` |
+| `TICK-CTL` | medium | `tick rate/freeze/step/sprint` |
+| `WIN-NAME`, `CASE-COLLISION` | medium | Windows device names (`con`, `nul`...), trailing dot/space, `:` streams; paths that differ only by case. Both are *refused* at install time |
+| `NBT-BOMB`, `JSON-DEEP`, `NBT-CORRUPT` | medium/low | gzip bombs in structures, absurdly nested JSON, undecodable NBT |
 | `HOOK-TICK`, `UNKNOWN-TYPE`, `LONG-LINE`, `OBFUSCATION`, `SCRIPT-FILE` | low | runs every tick, odd file types, minified/escaped lines, scripts outside `data/` (not installed) |
 | `HOOK-LOAD`, `ADV-FUNC` | info | where the library attaches |
 
@@ -94,15 +107,34 @@ Zips are extracted by Wardenpack's own extractor (no traversal, symlinks, or zip
 
 ## Known limits
 
-- The audit is **heuristic**. It matches known-dangerous patterns; it does not prove a
-  pack is safe, does not follow macro data flow, and cannot see behaviour that only emerges
-  at runtime. Treat "no findings" as "these rules did not match", and read what you install.
-- Libraries are namespaced by their own `data/<ns>/` directories; Phase 1 does not rename them.
-- No signed registry yet (Phase 3). Anything on an allow-listed host is trusted to the
-  extent *you* approve the summary and review the source.
-- Removing a library also removes tag entries equal to the ones it added, even if you
-  had added the identical entry yourself.
-- Case-insensitive filesystems and Windows reserved names are not specially handled.
+- The audit is **heuristic**. It matches known-dangerous patterns; it does not prove a pack is safe and cannot
+  see behaviour that only emerges at runtime. Treat "no findings" as "these rules did not match", and read what
+  you install.
+- Command detection is syntactic. Macros are handled where the danger is visible in the text (a command name or
+  `function` target built from `$(variable)`, including inside click events), but selectors, storage contents and
+  macro *arguments* are not evaluated, so a harmful command assembled from runtime data cannot be seen.
+- Libraries keep their own `data/<ns>/` namespace; Wardenpack does **not** rewrite it. A library that enters a
+  namespace owned by another library or by your project is refused, so collisions fail loudly at install time.
+  Renaming is deliberately not offered: rewriting `old:` ids inside functions, macros, storage, scoreboards and NBT
+  strings cannot be done soundly, and rewritten files would no longer match the upstream hashes you pinned.
+- Direct `warden add <url>` trusts whatever the allow-listed host serves at the commit you approve; the signed
+  registry (above) is the way to get an independent key to vouch for it.
+- Tag ownership is recorded in `warden.lock` (`added`). Removing a library only removes tag entries *it* added;
+  entries that were already there stay. If you add an identical entry by hand *after* installing, it cannot be told
+  apart from the library's own and is removed with it. Lock files from before 0.7.0 have no record and keep the old
+  behaviour until the library is re-added or updated.
+
+## Changelog
+
+**0.7.0** - Tag entries are removed only if the library added them (ownership moves to the remaining library when
+two share one); libraries cannot enter another library's or the project's namespace; installs refuse files that
+differ only by letter case from existing ones (Windows/macOS overwrite); `MACRO-FUNCTION` rule and macro variables
+inside click commands are checked. Lock files gain `added` per tag file (older locks still load).
+
+**0.6.0** - `/minecraft:op`-style namespaced commands no longer evade rules; command-block/minecart planting and
+NBT structures are audited; click/dialog actions in all JSON; Windows-name and case-collision hardening;
+SARIF output; **fixed**: absurdly nested JSON crashed `audit`, tag scanning, `verify_index` and project loading with
+an uncaught `RecursionError` (now reported/rejected cleanly).
 
 ## Develop
 
