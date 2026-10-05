@@ -29,8 +29,8 @@ def _read_json(path: Path) -> dict:
         raise ProjectError(f"{path.name} is unreasonably large")
     try:
         data = json.loads(path.read_text("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise ProjectError(f"{path.name}: invalid JSON ({e})") from None
+    except (ValueError, UnicodeDecodeError, RecursionError) as e:
+        raise ProjectError(f"{path.name}: invalid JSON ({type(e).__name__})") from None
     if not isinstance(data, dict):
         raise ProjectError(f"{path.name}: top level must be an object")
     return data

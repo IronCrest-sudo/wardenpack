@@ -113,7 +113,7 @@ def verify_index(raw: bytes, trusted_keys: list, threshold: int = 1, today: Opti
     """Return the signed payload only if enough trusted keys signed it and it is fresh/not rolled back."""
     try:
         env = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise RegistryError("index is not valid JSON") from None
     if not isinstance(env, dict) or "signed" not in env or not isinstance(env.get("signatures"), list):
         raise RegistryError("index: not a signed envelope")

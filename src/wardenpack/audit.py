@@ -6,8 +6,11 @@ import json
 import os
 import re
 import stat
+import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .safety import windows_hazard
 
 SEV = {"info": 0, "low": 1, "medium": 2, "high": 3}
 MAX_FINDINGS = 500
@@ -97,6 +100,12 @@ _SCRIPT_EXT = {".bat", ".cmd", ".ps1", ".psm1", ".sh", ".bash", ".py", ".pyc", "
 _TEXT_EXT = {".mcfunction", ".json", ".txt", ".md", ".mcmeta", ".snbt", ".properties", ".lang"}
 _CLICK_CMD = re.compile(r'(?:"value"|"command"|\bcommand)\s*:\s*"(/?[^"]*)"')
 _FUNC_ID = re.compile(r"^#?[a-z0-9_.-]+:[a-z0-9_./-]+$")
+# Command:"..." / Command:'...' inside setblock/summon/data SNBT (command blocks, command minecarts)
+_CMD_NBT = re.compile(r"""\bCommand\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')""")
+_CLICK_TYPES = {"run_command", "dynamic/run_command"}
+MAX_NBT_INFLATE = 32 * 1024 * 1024
+MAX_EMBED_DEPTH = 3
+MAX_JSON_NODES = 200_000
 
 
 # --------------------------------------------------------------------------- command parsing
@@ -113,7 +122,7 @@ def commands_in(raw: str) -> list:
     if macro:
         text = text[1:].lstrip()
     text = text.lstrip("/")
-    first = text.split(" ", 1)[0]
+    first = _bare(text.split(" ", 1)[0])
     cands = [text]
     if first in ("execute", "return"):
         parts = text.split(" run ")
@@ -123,6 +132,16 @@ def commands_in(raw: str) -> list:
         word, _, args = c.partition(" ")
         out.append((word, args.strip(), macro, c))
     return out
+
+
+def _bare(word: str) -> str:
+    """Lower-case command name without a 'minecraft:' namespace (so /minecraft:op is still op)."""
+    w = word.lower()
+    return w[len("minecraft:"):] if w.startswith("minecraft:") else w
+
+
+def _unescape(s: str) -> str:
+    return re.sub(r"\\(.)", r"\1", s)
 
 
 def _volume(args: str):
@@ -141,7 +160,7 @@ def _volume(args: str):
     return (abs(v[3] - v[0]) + 1) * (abs(v[4] - v[1]) + 1) * (abs(v[5] - v[2]) + 1)
 
 
-def _check_command(report, path, lineno, word, args, macro, full, installed, prefix="", raw=""):
+def _check_command(report, path, lineno, word, args, macro, full, installed, prefix="", raw="", depth=0):
     snippet = (raw or full)[:120]
 
     def emit(rule, sev, msg):
@@ -150,9 +169,11 @@ def _check_command(report, path, lineno, word, args, macro, full, installed, pre
     if macro and "$(" in word:
         emit("MACRO-CMD", "high", "command name is built from a macro variable (arbitrary command injection)")
         return
-    w = word.lower()
+    w = _bare(word)
     if w in _ADMIN:
         emit(*_ADMIN[w])
+    elif w == "tick" and re.match(r"(rate|freeze|step|sprint)\b", args):
+        emit("TICK-CTL", "medium", "changes the server tick rate / freezes the game")
     elif w == "kill" and re.search(r"@a\b|@e(?!\[[^\]]*type=)", args):
         emit("KILL-MASS", "medium", "kills every player/entity matched by a broad selector")
     elif w == "clear" and (not args or re.match(r"@[ae]\b", args)):
@@ -167,6 +188,22 @@ def _check_command(report, path, lineno, word, args, macro, full, installed, pre
         vol = _volume(args)
         if vol and vol >= 10000:
             emit("BLOCK-VOLUME", "medium", f"edits a very large region (~{int(vol)} blocks)")
+    if w in ("setblock", "summon", "data", "fill", "item", "give", "loot", "place"):
+        _check_embedded(report, path, lineno, args, installed, prefix, snippet, depth)
+
+
+def _check_embedded(report, path, lineno, text, installed, prefix, snippet, depth):
+    """Command blocks / command minecarts planted by a command: plant the command, audit it too."""
+    for m in _CMD_NBT.finditer(text):
+        report.add(Finding(prefix + "CMDBLOCK-INJECT", "medium", path, lineno,
+                           "plants a command (command block/minecart) that keeps running after the pack is removed",
+                           snippet, installed))
+        if depth >= MAX_EMBED_DEPTH:
+            continue
+        inner = _unescape(m.group(1) if m.group(1) is not None else m.group(2))
+        for word, args, macro, full in commands_in(inner):
+            _check_command(report, path, lineno, word, args, macro, full, installed,
+                           prefix=prefix + "CMDBLOCK-", raw=inner[:120], depth=depth + 1)
 
 
 # --------------------------------------------------------------------------- per-file analysis
@@ -209,8 +246,13 @@ def _analyze_json(report, rel, data: bytes, installed):
         return
     try:
         doc = json.loads(data.decode("utf-8", "replace"))
+    except RecursionError:
+        report.add(Finding("JSON-DEEP", "medium", rel, 0,
+                           "JSON nesting is absurdly deep (crashes parsers; could not be inspected)", "", installed))
+        return
     except ValueError:
         return
+    _scan_json_actions(report, rel, doc, installed)
     if not isinstance(doc, dict):
         return
     if p[1] == "minecraft" and p[2] == "tags" and len(p) >= 5 and p[3] in ("function", "functions"):
@@ -233,6 +275,71 @@ def _analyze_json(report, rel, data: bytes, installed):
                                f"advancement with tick trigger runs {func} for players repeatedly", "", installed))
         elif func:
             report.add(Finding("ADV-FUNC", "info", rel, 0, f"advancement reward runs {func}", "", installed))
+
+
+def _scan_json_actions(report, rel, doc, installed):
+    """run_command click events and dialog actions in ANY json file (dialogs, books, advancements,
+    loot tables, item components) - not only in .mcfunction text components."""
+    stack, seen, flagged = [doc], 0, False
+    while stack:
+        node = stack.pop()
+        seen += 1
+        if seen > MAX_JSON_NODES:
+            report.add(Finding("BIG-JSON", "low", rel, 0, "JSON too large to inspect fully", "", installed))
+            return
+        if isinstance(node, dict):
+            kind = node.get("action", node.get("type"))
+            if isinstance(kind, str) and kind.removeprefix("minecraft:") in _CLICK_TYPES:
+                cmd = node.get("command", node.get("value"))
+                if isinstance(cmd, str):
+                    if not flagged:
+                        flagged = True
+                        report.add(Finding("CLICK-RUN", "medium", rel, 0,
+                                           "JSON action runs a command as the clicking player", cmd[:120], installed))
+                    for word, args, macro, full in commands_in(cmd):
+                        _check_command(report, rel, 0, word, args, macro, full, installed,
+                                       prefix="CLICK-", raw=cmd)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
+
+def _analyze_nbt(report, rel, data: bytes, installed):
+    """Structure files (.nbt, gzip) and .snbt can carry command blocks. Read bounded, never trust size."""
+    if data[:2] == b"\x1f\x8b":
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            raw = d.decompress(data, MAX_NBT_INFLATE)
+        except zlib.error:
+            report.add(Finding("NBT-CORRUPT", "low", rel, 0, "gzip stream could not be decoded", "", installed))
+            return
+        if d.unconsumed_tail:
+            report.add(Finding("NBT-BOMB", "medium", rel, 0, "decompresses beyond 32 MiB (possible bomb)", "", installed))
+            return
+    else:
+        raw = data
+    if rel.endswith(".snbt"):
+        _check_embedded(report, rel, 0, raw.decode("utf-8", "replace"), installed, "", "", 0)
+        return
+    needle = b"\x08\x00\x07Command"
+    pos, found = 0, 0
+    while found < 200:
+        i = raw.find(needle, pos)
+        if i < 0:
+            break
+        j = i + len(needle)
+        if j + 2 > len(raw):
+            break
+        n = int.from_bytes(raw[j:j + 2], "big")
+        cmd = raw[j + 2:j + 2 + n].decode("utf-8", "replace")
+        pos, found = j + 2 + n, found + 1
+        if not cmd.strip():
+            continue
+        report.add(Finding("CMDBLOCK-NBT", "medium", rel, 0,
+                           "structure contains a command block/minecart command", cmd[:120], installed))
+        for word, args, macro, full in commands_in(cmd):
+            _check_command(report, rel, 0, word, args, macro, full, installed,
+                           prefix="CMDBLOCK-", raw=cmd, depth=1)
 
 
 def _check_file_type(report, rel, full: Path, installed):
@@ -302,13 +409,21 @@ def _find_cycles(report, edges):
 # --------------------------------------------------------------------------- entry points
 def audit_tree(root) -> AuditReport:
     root = Path(root)
-    report, edges = AuditReport(), []
+    report, edges, lowered = AuditReport(), [], {}
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if d != ".git")
         for name in sorted(dirnames + filenames):
             full = Path(dirpath) / name
             rel = full.relative_to(root).as_posix()
             installed = rel.startswith(INSTALLED_ROOTS)
+            hazard = windows_hazard(rel)
+            if hazard:
+                report.add(Finding("WIN-NAME", "medium", rel, 0, hazard, "", installed))
+            other = lowered.setdefault(rel.lower(), rel)
+            if other != rel:
+                report.add(Finding("CASE-COLLISION", "medium", rel, 0,
+                                   f"differs from '{other}' only by letter case (one overwrites the other on Windows/macOS)",
+                                   "", installed))
             st = os.lstat(full)
             if stat.S_ISLNK(st.st_mode):
                 report.add(Finding("SYMLINK", "high", rel, 0, "symbolic link", "", installed))
@@ -322,13 +437,15 @@ def audit_tree(root) -> AuditReport:
                 report.add(Finding("BIG-FILE", "low", rel, 0, "file too large to analyse", "", installed))
                 continue
             ext = os.path.splitext(rel)[1].lower()
-            if ext not in (".mcfunction", ".json"):
+            if ext not in (".mcfunction", ".json", ".nbt", ".snbt"):
                 continue
             data = full.read_bytes()
             if ext == ".mcfunction":
                 _analyze_mcfunction(report, rel, data, installed, edges)
-            else:
+            elif ext == ".json":
                 _analyze_json(report, rel, data, installed)
+            else:
+                _analyze_nbt(report, rel, data, installed)
     _find_cycles(report, edges)
     return report
 
