@@ -170,6 +170,8 @@ def _check_command(report, path, lineno, word, args, macro, full, installed, pre
         emit("MACRO-CMD", "high", "command name is built from a macro variable (arbitrary command injection)")
         return
     w = _bare(word)
+    if macro and w == "function" and "$(" in args.split(" ", 1)[0]:
+        emit("MACRO-FUNCTION", "medium", "function to run is chosen by a macro variable (can reach any pack's functions)")
     if w in _ADMIN:
         emit(*_ADMIN[w])
     elif w == "tick" and re.match(r"(rate|freeze|step|sprint)\b", args):
@@ -228,9 +230,12 @@ def _analyze_mcfunction(report, rel, data: bytes, installed, edges):
             cmds = _CLICK_CMD.findall(raw)
             report.add(Finding("CLICK-RUN", "medium", rel, n,
                                "text component runs a command as the clicking player", raw.strip()[:120], installed))
+            line_macro = raw.lstrip().startswith("$")      # $(x) inside a click command is expanded too
             for c in cmds:
-                for word, args, macro, full in commands_in(c):
-                    _check_command(report, rel, n, word, args, macro, full, installed, prefix="CLICK-", raw=c)
+                # in a macro line the click command is expanded too; a leading '$(' is a variable, not the marker
+                for word, args, macro, full in commands_in("$" + c.lstrip() if line_macro else c):
+                    _check_command(report, rel, n, word, args, macro, full, installed,
+                                   prefix="CLICK-", raw=c)
 
 
 def _function_id(rel: str):
