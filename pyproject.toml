@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wardenpack"
+version = "0.4.0"
+description = "A security-first datapack library manager (hash-pinned, namespace-isolated, audit-friendly)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Unlicense" }
+dependencies = []          # stdlib only on purpose: the client has no third-party supply chain
+
+[project.optional-dependencies]
+sign = ["cryptography>=42"]   # maintainers only: key generation + signing (clients can verify without it)
+showcase = ["pillow>=10"]     # maintainers only: GIF recording
+
+[project.scripts]
+warden = "wardenpack.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
