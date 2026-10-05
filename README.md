@@ -14,6 +14,8 @@ warden add <https-or-ssh-url> [--ref BRANCH_OR_TAG] [--name ID] [--yes]
 warden install            # restores exactly what warden.lock pins
 warden remove <name>      # deletes only files it owns and you did not edit
 warden verify             # re-hash installed files against warden.lock
+warden update [names...] [--force]   # newest allowed revision, change list, rollback on failure
+warden import-sculk [libraries.json] [--apply]   # migrate from sculk-cli (dry run by default)
 warden list
 warden audit [folder | pack.zip | https-url] [--format json] [--fail-on high|medium|low|never]
 ```
@@ -22,6 +24,8 @@ warden audit [folder | pack.zip | https-url] [--format json] [--fail-on high|med
 **block on any high finding** (`--fail-on`, or `"audit": {"fail_on": "medium"}` in `warden.json`).
 Executables/scripts inside `data/` or `assets/` are **always** refused, whatever the policy.
 `warden audit` exits with status 2 when findings reach the threshold, so it works in CI.
+
+See [docs/COMPARISON.md](docs/COMPARISON.md) for an honest feature/limit comparison with sculk-cli.
 
 ## Registry (Phase 3): signed, pinned, low-maintenance
 

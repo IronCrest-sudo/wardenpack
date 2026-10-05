@@ -1,6 +1,7 @@
 """Project state (warden.json + warden.lock) and the install/remove/verify engine."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -76,7 +77,8 @@ DEFAULT_PACK_FORMAT = 122
 
 
 def init_project(root, namespace: str, author: str = "", game_version: str = "26.3",
-                 pack_format: Optional[int] = None, description: str = "") -> list[str]:
+                 pack_format: Optional[int] = None, description: str = "",
+                 kind: str = "datapack") -> list[str]:
     root = Path(root).resolve()
     safety.validate_namespace(namespace)
     if (root / "warden.json").exists():
@@ -91,11 +93,14 @@ def init_project(root, namespace: str, author: str = "", game_version: str = "26
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, "utf-8")
 
-    for kind in ("load", "tick"):
-        write_if_absent(f"data/minecraft/tags/function/{kind}.json",
-                        json.dumps({"values": [f"{namespace}:global/{kind}"]}, indent=2) + "\n")
-        write_if_absent(f"data/{namespace}/function/global/{kind}.mcfunction",
-                        f"# {kind} entry point of {namespace}\n")
+    if kind == "resourcepack":
+        write_if_absent(f"assets/{namespace}/lang/en_us.json", "{}\n")
+    else:
+        for hook in ("load", "tick"):
+            write_if_absent(f"data/minecraft/tags/function/{hook}.json",
+                            json.dumps({"values": [f"{namespace}:global/{hook}"]}, indent=2) + "\n")
+            write_if_absent(f"data/{namespace}/function/global/{hook}.mcfunction",
+                            f"# {hook} entry point of {namespace}\n")
     if pack_format is None:
         pack_format = DEFAULT_PACK_FORMAT
         notes.append(f"pack format {pack_format} comes from core's merge-manifest.json - "
@@ -105,7 +110,7 @@ def init_project(root, namespace: str, author: str = "", game_version: str = "26
                   "min_format": pack_format, "max_format": pack_format}}, indent=2) + "\n")
     _write_json(root / "warden.json", {
         "schema": SCHEMA, "name": namespace, "version": "1.0.0", "author": author,
-        "game_version": game_version, "libraries": {}})
+        "game_version": game_version, "type": kind, "libraries": {}})
     _write_json(root / "warden.lock", {"schema": SCHEMA, "libraries": {}})
     return notes
 
@@ -208,9 +213,15 @@ def apply_content(project: Project, lib_id: str, content: LibraryContent,
 
 
 def summarize(lib_id: str, source: str, commit: str, content: LibraryContent,
-              report: Optional[AuditReport] = None) -> list[str]:
+              report: Optional[AuditReport] = None, old_files: Optional[dict] = None) -> list[str]:
     lines = [f"Library : {lib_id}", f"Source  : {source}", f"Commit  : {commit}",
              f"Files   : {len(content.files)} in {', '.join(content.namespaces()) or '-'}"]
+    if old_files is not None:
+        add = sorted(set(content.hashes) - set(old_files))
+        gone = sorted(set(old_files) - set(content.hashes))
+        chg = sorted(r for r in set(content.hashes) & set(old_files) if content.hashes[r] != old_files[r])
+        lines.append(f"Changes : +{len(add)} added, ~{len(chg)} changed, -{len(gone)} removed")
+        lines += [f"  {m} {r}" for m, rs in (("+", add), ("~", chg), ("-", gone)) for r in rs[:6]]
     for rel in sorted(content.tags):
         vals = ", ".join(v if isinstance(v, str) else v["id"] for v in content.tags[rel]) or "(none)"
         lines.append(f"HOOKS   : {_tag_title(rel)} <- {vals}")
@@ -256,7 +267,8 @@ def _enforce_audit(report: AuditReport, level: str) -> None:
 
 def _stage_and_apply(project, lib_id, source, ref, commit, allow_local, ignore_game_version,
                      confirm: Confirm, owned=None, expected_integrity=None,
-                     fail_on: Optional[str] = None, skip_audit: bool = False) -> dict:
+                     fail_on: Optional[str] = None, skip_audit: bool = False,
+                     pre_apply: Optional[Callable[[], None]] = None, old_files: Optional[dict] = None) -> dict:
     level = _fail_level(project, fail_on)
     with tempfile.TemporaryDirectory(prefix="warden-") as tmp:
         stage = Path(tmp) / "src"
@@ -274,8 +286,10 @@ def _stage_and_apply(project, lib_id, source, ref, commit, allow_local, ignore_g
         if not skip_audit:                  # restores are byte-identical to what was already approved
             report = audit_tree(stage)
             _enforce_audit(report, level)
-        if confirm is not None and not confirm(summarize(lib_id, source, got, content, report)):
+        if confirm is not None and not confirm(summarize(lib_id, source, got, content, report, old_files)):
             raise Aborted("installation cancelled")
+        if pre_apply is not None:
+            pre_apply()
         record = apply_content(project, lib_id, content, owned=owned)
         if report is not None:
             record["audit"] = report.counts()
@@ -498,12 +512,13 @@ def _split_spec(target: str) -> tuple[str, str]:
 
 
 def _install_from_registry(project, lib_id, name, spec, allow_stale, offline, extra_hosts, allow_local,
-                           ignore_game_version, confirm, fail_on):
+                           ignore_game_version, confirm, fail_on, pre_apply=None, old_files=None):
     signed = load_registry(project, name, allow_stale, offline)
     entry, ver = reg.resolve(signed, lib_id, spec, project.manifest.get("game_version"), ignore_game_version)
     source = safety.validate_source(entry["source"], project.hosts(extra_hosts), allow_local)
     record = _stage_and_apply(project, lib_id, source, None, ver["commit"], allow_local, ignore_game_version,
-                              confirm, expected_integrity=ver["integrity"], fail_on=fail_on)
+                              confirm, expected_integrity=ver["integrity"], fail_on=fail_on,
+                              pre_apply=pre_apply, old_files=old_files)
     record["registry"] = {"name": name, "version": signed["version"], "resolved": ver["version"]}
     return source, record
 
@@ -567,3 +582,125 @@ def check_revocations(project: Project, refresh: bool = False) -> list[str]:
                     problems.append(f"{lib_id}: REVOKED by registry '{name}': {why}")
     project.save()
     return problems
+
+
+# ----------------------------------------------------------------- update
+def update_libraries(project: Project, names=None, force: bool = False, allow_local: bool = False,
+                     extra_hosts=(), ignore_game_version: bool = False, confirm: Confirm = None,
+                     fail_on: Optional[str] = None, allow_stale: bool = False,
+                     offline: bool = False) -> list[tuple[str, str]]:
+    """Move installed libraries to their newest allowed revision, all-or-nothing per library."""
+    hosts = project.hosts(extra_hosts)
+    results = []
+    for lib_id in (sorted(names) if names else sorted(project.lock["libraries"])):
+        entry = project.lock["libraries"].get(lib_id)
+        if entry is None:
+            raise ProjectError(f"'{lib_id}' is not installed")
+        spec = project.manifest["libraries"].get(lib_id) or {}
+        source = safety.validate_source(entry.get("source", ""), hosts, allow_local)
+        edited = [p for p in check_entry(project, entry) if p.startswith("modified")]
+        if edited and not force:
+            results.append((lib_id, f"skipped: you edited {len(edited)} file(s) (use --force to overwrite)"))
+            continue
+        r = entry.get("registry")
+        if r:
+            signed = load_registry(project, r["name"], allow_stale, offline)
+            _, ver = reg.resolve(signed, lib_id, spec.get("spec", ""), project.manifest.get("game_version"),
+                                 ignore_game_version)
+            newest = ver["commit"]
+        else:
+            with tempfile.TemporaryDirectory(prefix="warden-peek-") as tmp:
+                newest = fetch(source, Path(tmp) / "p", ref=entry.get("ref"), allow_local=allow_local)
+        if newest == entry["commit"]:
+            results.append((lib_id, "up to date"))
+            continue
+        snap_lock, snap_man = copy.deepcopy(project.lock), copy.deepcopy(project.manifest)
+        backups = {}
+        for rel in list(entry.get("files", {})) + list(entry.get("tags", {})):
+            t = ensure_safe_target(project.root, rel)
+            if t.is_file():
+                backups[t] = t.read_bytes()
+        pre = lambda: remove_library(project, lib_id, force=True)       # noqa: E731
+        try:
+            if r:
+                _, rec = _install_from_registry(project, lib_id, r["name"], spec.get("spec", ""), allow_stale,
+                                                offline, extra_hosts, allow_local, ignore_game_version, confirm,
+                                                fail_on, pre_apply=pre, old_files=entry.get("files"))
+            else:
+                rec = _stage_and_apply(project, lib_id, source, entry.get("ref"), None, allow_local,
+                                       ignore_game_version, confirm, fail_on=fail_on, pre_apply=pre,
+                                       old_files=entry.get("files"))
+        except BaseException as exc:
+            for t, data in backups.items():                              # put the old version back
+                t.parent.mkdir(parents=True, exist_ok=True)
+                t.write_bytes(data)
+            project.lock.clear(); project.lock.update(snap_lock)
+            project.manifest.clear(); project.manifest.update(snap_man)
+            project.save()
+            if isinstance(exc, (Aborted, AuditError)):
+                results.append((lib_id, "not updated: " + str(exc).splitlines()[0]))
+                continue
+            raise
+        project.lock["libraries"][lib_id] = rec
+        project.manifest["libraries"][lib_id] = snap_man["libraries"][lib_id]
+        project.save()
+        results.append((lib_id, f"updated {entry['commit'][:10]} -> {rec['commit'][:10]}"))
+    return results
+
+
+# ----------------------------------------------------------------- import from sculk-cli
+def import_sculk(project: Project, path, apply: bool = False, allow_local: bool = False, extra_hosts=(),
+                 ignore_game_version: bool = False, confirm: Confirm = None, fail_on: Optional[str] = None,
+                 allow_stale: bool = False, offline: bool = False) -> list[tuple[str, str]]:
+    """Plan (default) or perform the migration of a sculk-cli libraries.json. Nothing is trusted from it:
+    every source is re-validated, upgraded http->https only on allow-listed hosts, then audited as usual."""
+    data = _read_json(Path(path))
+    libs = data.get("libraries")
+    if not isinstance(libs, list):
+        raise ProjectError("not a sculk libraries.json (missing 'libraries' list)")
+    hosts = project.hosts(extra_hosts)
+    out = []
+    if data.get("game_version") and project.manifest.get("game_version") not in (None, data["game_version"]):
+        out.append(("(project)", f"note: file targets game {data['game_version']}, project uses "
+                                 f"{project.manifest.get('game_version')}"))
+    for item in libs:
+        if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+            out.append(("?", "skipped: malformed entry"))
+            continue
+        src = item["source"]
+        note = ""
+        if src.startswith("http://"):
+            src, note = "https://" + src[len("http://"):], " (http upgraded to https)"
+        ident = item.get("identifier") if isinstance(item.get("identifier"), str) else ""
+        try:
+            src = safety.validate_source(src, hosts, allow_local)
+            name = ident if ("://" not in ident and ident) else safety.name_from_source(src)
+            safety.validate_lib_id(name)
+        except UnsafeInput as e:
+            out.append((ident or src[:40], f"skipped: {e}"))
+            continue
+        if name in project.lock["libraries"] or name in project.manifest["libraries"]:
+            out.append((name, "already installed"))
+            continue
+        if not apply:
+            out.append((name, f"would install from {src}{note}"))
+            continue
+        ver = item.get("version") if isinstance(item.get("version"), str) else ""
+        try:
+            done = False
+            if project.manifest.get("registries") and ident and "://" not in ident:
+                try:
+                    add_from_registry(project, f"{name}@{ver}" if ver else name, None, allow_stale, offline,
+                                      extra_hosts, allow_local, ignore_game_version, confirm, fail_on)
+                    out.append((name, "installed from registry (pinned, signed)"))
+                    done = True
+                except reg.RegistryError as e:
+                    if "is not in registry" not in str(e) and "no usable version" not in str(e):
+                        raise
+            if not done:
+                add_library(project, src, None, name, allow_local, extra_hosts, ignore_game_version,
+                            confirm, fail_on)
+                out.append((name, f"installed from git{note}; pinned to commit {project.lock['libraries'][name]['commit'][:10]}"))
+        except (Aborted, AuditError, ConflictError, ProjectError, reg.RegistryError, UnsafeInput) as e:
+            out.append((name, "NOT installed: " + str(e).splitlines()[0]))
+    return out

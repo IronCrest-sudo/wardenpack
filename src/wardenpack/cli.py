@@ -9,8 +9,8 @@ from . import __version__
 from .audit import SEV, format_finding
 from . import maintain
 from .core import (FAIL_LEVELS, Project, add_from_registry, add_library, audit_target, check_revocations,
-                   init_project, install_all, registry_add, registry_remove, remove_library,
-                   search_registries, verify_all)
+                   import_sculk, init_project, install_all, registry_add, registry_remove, remove_library,
+                   search_registries, update_libraries, verify_all)
 from .safety import DEFAULT_HOSTS
 from .errors import Aborted, WardenError
 
@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--author", default="")
     s.add_argument("--game-version", default="26.3")
     s.add_argument("--pack-format", type=int, default=None)
+    s.add_argument("--rp", action="store_true", help="resource pack skeleton instead of a datapack")
 
     def net(sp):
         sp.add_argument("--allow-host", action="append", default=[], metavar="HOST")
@@ -58,6 +59,20 @@ def build_parser() -> argparse.ArgumentParser:
     net(s)
 
     s = sub.add_parser("install", help="install everything in warden.json, exactly as locked")
+    net(s)
+
+    s = sub.add_parser("update", help="move libraries to their newest allowed revision (shows a change list)")
+    s.add_argument("names", nargs="*")
+    s.add_argument("--force", action="store_true", help="overwrite files you edited")
+    s.add_argument("--offline", action="store_true")
+    s.add_argument("--allow-stale", action="store_true")
+    net(s)
+
+    s = sub.add_parser("import-sculk", help="migrate a sculk-cli libraries.json (dry run unless --apply)")
+    s.add_argument("file", nargs="?", default="libraries.json")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--offline", action="store_true")
+    s.add_argument("--allow-stale", action="store_true")
     net(s)
 
     s = sub.add_parser("remove", help="uninstall a library (only files it owns and you did not edit)")
@@ -138,7 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args) -> int:
     if args.cmd == "init":
         for n in init_project(args.project_dir, args.namespace, args.author,
-                              args.game_version, args.pack_format):
+                              args.game_version, args.pack_format,
+                              kind="resourcepack" if args.rp else "datapack"):
             print("note:", n)
         print(f"initialised '{args.namespace}'")
         return 0
@@ -166,6 +182,22 @@ def run(args) -> int:
                                        args.ignore_game_version, _confirm_factory(args.yes),
                                        args.fail_on):
             print(f"{lib}: {status}")
+    elif args.cmd == "update":
+        res = update_libraries(project, args.names, args.force, args.allow_local, args.allow_host,
+                               args.ignore_game_version, _confirm_factory(args.yes), args.fail_on,
+                               args.allow_stale, args.offline)
+        for lib, status in res:
+            print(f"{lib}: {status}")
+        return 1 if any(st.startswith(("not updated", "skipped")) for _, st in res) else 0
+    elif args.cmd == "import-sculk":
+        res = import_sculk(project, args.file, args.apply, args.allow_local, args.allow_host,
+                           args.ignore_game_version, _confirm_factory(args.yes), args.fail_on,
+                           args.allow_stale, args.offline)
+        for lib, status in res:
+            print(f"{lib}: {status}")
+        if not args.apply:
+            print("\n(dry run - nothing was changed; re-run with --apply to install)")
+        return 1 if any(st.startswith("NOT installed") for _, st in res) else 0
     elif args.cmd == "remove":
         rep = remove_library(project, args.name, args.force)
         print(f"removed {len(rep.removed)} item(s)")
